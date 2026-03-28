@@ -104,13 +104,15 @@ function detectBBSqueeze(widthHistory){
 // ════════════════════════════════════════════════════════════════════════
 //  SQUEEZE SCORING + ROUTING
 // ════════════════════════════════════════════════════════════════════════
-function computeSqueezeScore({shortInterest,daysToCover,costToBorrow,siDelta,relativeVolume}){
+function computeSqueezeScore({shortInterest,daysToCover,costToBorrow,siDelta,relativeVolume,putCallRatio,ivRank}){
   let s=0;
   if(shortInterest>=25)s+=30;else if(shortInterest>=15)s+=20;else if(shortInterest>=10)s+=10;
   if(daysToCover>=10)s+=25;else if(daysToCover>=5)s+=15;else if(daysToCover>=3)s+=8;
   if(costToBorrow>=100)s+=20;else if(costToBorrow>=30)s+=12;else if(costToBorrow>=10)s+=5;
   if(siDelta>5)s+=15;else if(siDelta>2)s+=8;else if(siDelta>0)s+=3;
   if(relativeVolume>=3)s+=10;else if(relativeVolume>=1.5)s+=5;
+  if(putCallRatio&&putCallRatio<0.5)s+=8;else if(putCallRatio&&putCallRatio>1.5)s+=3;
+  if(ivRank>0&&ivRank<50)s+=5;
   return clamp(s,0,100);
 }
 function routeSignal({squeezeScore, ivRank, relativeVolume}){
@@ -118,6 +120,118 @@ function routeSignal({squeezeScore, ivRank, relativeVolume}){
   if(relativeVolume >= 2 && squeezeScore >= 50) return "cfd";
   if(ivRank >= 70) return "cfd";
   return squeezeScore >= 60 ? "options" : "cfd";
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  DATA FETCHING ENGINE — Finviz, CSV, IBKR
+// ════════════════════════════════════════════════════════════════════════
+const CORS_PROXIES = [
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+];
+
+async function fetchWithProxy(url) {
+  for (const proxyFunc of CORS_PROXIES) {
+    try {
+      const proxyUrl = proxyFunc(url);
+      const response = await fetch(proxyUrl, { mode: 'cors' });
+      if (response.ok) return await response.text();
+    } catch (e) { continue; }
+  }
+  throw new Error("Tous les proxies CORS ont échoué. Utilisez l'import CSV.");
+}
+
+async function parseFinvizHTML(html) {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    const rows = doc.querySelectorAll('tr[class*="screener"]');
+    const results = [];
+    rows.forEach((row, idx) => {
+      if (idx === 0) return;
+      const cells = row.querySelectorAll('td');
+      if (cells.length < 14) return;
+      const ticker = cells[1]?.textContent?.trim() || '';
+      if (!ticker) return;
+      const parseNum = (str) => {
+        if (!str) return 0; str = str.trim();
+        if (str === '—' || str === '-') return 0;
+        str = str.replace('%','');
+        const m = str.match(/([0-9.]+)([KMB]?)/);
+        if (!m) return 0;
+        let val = parseFloat(m[1]);
+        if (m[2] === 'K') val *= 1e3; if (m[2] === 'M') val *= 1e6; if (m[2] === 'B') val *= 1e9;
+        return val;
+      };
+      // v=161 columns: No(0), Ticker(1), MarketCap(2), Outstanding(3), Float(4), InsOwn(5), InsTrans(6), InstOwn(7), InstTrans(8), FloatShort(9), ShortRatio(10), AvgVol(11), Price(12), Change(13), Volume(14)
+      const shortFloat = parseNum(cells[9]?.textContent);
+      const shortRatio = parseNum(cells[10]?.textContent);
+      const avgVolume = parseNum(cells[11]?.textContent);
+      const price = parseNum(cells[12]?.textContent);
+      const volume = parseNum(cells[14]?.textContent || cells[13]?.textContent);
+      const relVol = avgVolume > 0 ? volume / avgVolume : 1;
+      results.push({
+        ticker, shortInterest: shortFloat, daysToCover: shortRatio,
+        price, avgVolume, volume, relativeVolume: Math.max(0.1, relVol),
+        marketCap: parseNum(cells[2]?.textContent), instOwn: parseNum(cells[7]?.textContent),
+        costToBorrow: 0, siDelta: 0, putCallRatio: 0, ivRank: 0,
+        source: 'finviz', fetched: true
+      });
+    });
+    return results;
+  } catch (e) { console.error('Erreur parsing Finviz:', e); return []; }
+}
+
+async function fetchFinvizPage(page = 1) {
+  const start = (page - 1) * 20 + 1;
+  const url = `https://finviz.com/screener.ashx?v=161&f=sh_short_o5&o=-sh_short&r=${start}`;
+  const html = await fetchWithProxy(url);
+  return parseFinvizHTML(html);
+}
+
+async function runFinvizScan(maxPages = 10, onProgress) {
+  const allResults = [];
+  for (let i = 1; i <= maxPages; i++) {
+    if (onProgress) onProgress({ current: i, total: maxPages, status: `Page ${i}/${maxPages}...` });
+    try {
+      const pageResults = await fetchFinvizPage(i);
+      if (pageResults.length === 0 && i > 1) break;
+      allResults.push(...pageResults);
+    } catch(e) { if (i === 1) throw e; break; }
+    await new Promise(r => setTimeout(r, 800));
+  }
+  return allResults;
+}
+
+function parseFinvizCSV(csvText) {
+  try {
+    const lines = csvText.trim().split('\n');
+    if (lines.length < 2) return [];
+    const header = lines[0].split(',').map(h => h.trim().replace(/"/g,'').toLowerCase());
+    const results = [];
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].match(/(".*?"|[^",]+)/g)?.map(v => v.replace(/"/g, '').trim()) || [];
+      const obj = {}; header.forEach((h, idx) => { obj[h] = parts[idx] || ''; });
+      const parseN = s => { if(!s||s==='—')return 0; return parseFloat(s.replace('%','').replace(',',''))||0; };
+      const ticker = (obj.ticker || obj.symbol || '').toUpperCase();
+      if (!ticker) continue;
+      const si = parseN(obj['float short'] || obj['short float'] || obj['short interest'] || '0');
+      const dtc = parseN(obj['short ratio'] || obj['days to cover'] || '0');
+      const relVol = parseN(obj['relative volume'] || obj['rel volume'] || '1');
+      results.push({ ticker, shortInterest: si, daysToCover: dtc, relativeVolume: relVol || 1,
+        costToBorrow: 0, siDelta: 0, putCallRatio: 0, ivRank: 0, source: 'csv', fetched: true });
+    }
+    return results;
+  } catch (e) { console.error('Erreur CSV:', e); return []; }
+}
+
+async function ibkrTestConnection(ibkrConfig) {
+  try {
+    const r = await fetch(`${ibkrConfig.url}/v1/api/iserver/auth/status`, { credentials: 'include' });
+    return { connected: r.ok, message: r.ok ? 'IBKR Gateway connecté' : 'Non authentifié' };
+  } catch (e) {
+    return { connected: false, message: 'Gateway non disponible. Lancez le Client Portal.' };
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -385,11 +499,16 @@ function Dashboard({activeAccount, trades, positions, account, checklist, scanne
 // ════════════════════════════════════════════════════════════════════════
 function SqueezeScanner({scannerItems,setScannerItems,suggestions,setSuggestions}){
   const [adding,setAdding]=useState(false);
-  const [form,setForm]=useState({ticker:"",shortInterest:"",daysToCover:"",costToBorrow:"",siDelta:"",relativeVolume:"",notes:"",putCallRatio:"",ivRank:"",source:"finviz"});
+  const [dataSource,setDataSource]=useState("manual");
+  const [scanning,setScanning]=useState(false);
+  const [scanProgress,setScanProgress]=useState(null);
+  const [enrichingId,setEnrichingId]=useState(null);
+  const [enrichForm,setEnrichForm]=useState({costToBorrow:"",siDelta:"",ivRank:"",putCallRatio:""});
+  const [form,setForm]=useState({ticker:"",shortInterest:"",daysToCover:"",costToBorrow:"",siDelta:"",relativeVolume:"",notes:"",putCallRatio:"",ivRank:"",source:"manual"});
   const [editId,setEditId]=useState(null);
   const [sortBy,setSortBy]=useState("squeezeScore");
   const [minScore,setMinScore]=useState(0);
-  const reset=()=>{setForm({ticker:"",shortInterest:"",daysToCover:"",costToBorrow:"",siDelta:"",relativeVolume:"",notes:"",putCallRatio:"",ivRank:"",source:"finviz"});setAdding(false);setEditId(null);};
+  const reset=()=>{setForm({ticker:"",shortInterest:"",daysToCover:"",costToBorrow:"",siDelta:"",relativeVolume:"",notes:"",putCallRatio:"",ivRank:"",source:"manual"});setAdding(false);setEditId(null);};
 
   const save=()=>{
     const p={ticker:form.ticker.toUpperCase(),shortInterest:parseFloat(form.shortInterest)||0,daysToCover:parseFloat(form.daysToCover)||0,
@@ -408,6 +527,64 @@ function SqueezeScanner({scannerItems,setScannerItems,suggestions,setSuggestions
     reset();
   };
 
+  const startFinvizScan = async () => {
+    setScanning(true);
+    setScanProgress({current:0,total:10,status:'Initialisation scan Finviz...'});
+    try {
+      const results = await runFinvizScan(10, prog => setScanProgress(prog));
+      const newItems = results.map(r => ({...r, id:uid(), addedDate:td(), squeezeScore:computeSqueezeScore(r), routedTo:routeSignal(r)}));
+      setScannerItems(prev => {
+        const existing = new Map(prev.map(i => [i.ticker, i]));
+        const merged = newItems.map(n => {
+          const ex = existing.get(n.ticker);
+          if(ex) return {...n, id:ex.id, costToBorrow:ex.costToBorrow||n.costToBorrow, siDelta:ex.siDelta||n.siDelta, ivRank:ex.ivRank||n.ivRank, putCallRatio:ex.putCallRatio||n.putCallRatio, notes:ex.notes};
+          return n;
+        });
+        merged.forEach(m => { m.squeezeScore=computeSqueezeScore(m); m.routedTo=routeSignal(m); });
+        return merged;
+      });
+      // Auto-generate suggestions for high scores
+      newItems.filter(i=>i.squeezeScore>=40).forEach(i=>{
+        setSuggestions(prev=>{const ex=prev.find(s=>s.ticker===i.ticker&&s.status==="pending");
+          const sug={id:uid(),ticker:i.ticker,squeezeScore:i.squeezeScore,routedTo:i.routedTo,ivRank:i.ivRank,relativeVolume:i.relativeVolume,shortInterest:i.shortInterest,daysToCover:i.daysToCover,createdAt:td(),status:"pending"};
+          return ex?prev.map(s=>s.id===ex.id?sug:s):[sug,...prev];});
+      });
+      setScanProgress({current:10,total:10,status:`Terminé — ${results.length} titres récupérés`});
+      setTimeout(()=>setScanProgress(null),3000);
+    } catch(e) {
+      setScanProgress({current:0,total:1,status:`Erreur: ${e.message}`});
+    } finally { setScanning(false); }
+  };
+
+  const handleCSVUpload = (e) => {
+    const file=e.target.files?.[0]; if(!file) return;
+    const reader=new FileReader();
+    reader.onload=(evt)=>{
+      const csv=evt.target?.result;
+      if(typeof csv==='string'){
+        const results=parseFinvizCSV(csv);
+        const newItems=results.map(r=>({...r,id:uid(),addedDate:td(),squeezeScore:computeSqueezeScore(r),routedTo:routeSignal(r)}));
+        setScannerItems(prev=>[...newItems,...prev]);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value='';
+  };
+
+  const saveEnrichment = () => {
+    const item=scannerItems.find(s=>s.id===enrichingId);
+    if(!item)return;
+    const updated={...item, costToBorrow:parseFloat(enrichForm.costToBorrow)||item.costToBorrow, siDelta:parseFloat(enrichForm.siDelta)||item.siDelta,
+      ivRank:parseFloat(enrichForm.ivRank)||item.ivRank, putCallRatio:parseFloat(enrichForm.putCallRatio)||item.putCallRatio};
+    updated.squeezeScore=computeSqueezeScore(updated); updated.routedTo=routeSignal(updated);
+    setScannerItems(prev=>prev.map(s=>s.id===enrichingId?updated:s));
+    if(updated.squeezeScore>=40){
+      const sug={id:uid(),ticker:updated.ticker,squeezeScore:updated.squeezeScore,routedTo:updated.routedTo,ivRank:updated.ivRank,relativeVolume:updated.relativeVolume,shortInterest:updated.shortInterest,daysToCover:updated.daysToCover,createdAt:td(),status:"pending"};
+      setSuggestions(prev=>{const ex=prev.find(s=>s.ticker===updated.ticker&&s.status==="pending");return ex?prev.map(s=>s.id===ex.id?sug:s):[sug,...prev];});
+    }
+    setEnrichingId(null);
+  };
+
   const sorted=[...scannerItems].filter(s=>(s.squeezeScore||0)>=minScore).sort((a,b)=>(b[sortBy]||0)-(a[sortBy]||0));
   const scoreBg=s=>s>=70?"bg-red-500/10 border-red-500/20":s>=40?"bg-amber-500/10 border-amber-500/20":"bg-gray-800/50 border-gray-700/30";
 
@@ -415,19 +592,26 @@ function SqueezeScanner({scannerItems,setScannerItems,suggestions,setSuggestions
     <div className="space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="text-lg font-bold text-white flex items-center gap-2"><Flame size={20} className="text-orange-400"/>Short Squeeze Scanner</h2>
-        <div className="flex gap-2 items-center">
+        <div className="flex gap-2 items-center flex-wrap">
+          <Sel options={[{value:"manual",label:"Manuel"},{value:"finviz",label:"Finviz Auto"},{value:"csv",label:"CSV Import"}]} value={dataSource} onChange={e=>setDataSource(e.target.value)}/>
+          {dataSource==="finviz"&&<button onClick={startFinvizScan} disabled={scanning} className={`${C.btn} ${scanning?C.btnG:C.btnS} flex items-center gap-2`}><RefreshCw size={14} className={scanning?"animate-spin":""}/>{scanning?"Scan en cours...":"Lancer Scan"}</button>}
+          {dataSource==="csv"&&<><input type="file" accept=".csv" onChange={handleCSVUpload} className="hidden" id="csvUpload"/><label htmlFor="csvUpload" className={`${C.btn} ${C.btnP} flex items-center gap-2 cursor-pointer`}><Upload size={14}/>Importer CSV</label></>}
+          {dataSource==="manual"&&<button onClick={()=>{reset();setAdding(true);}} className={`${C.btn} ${C.btnP} flex items-center gap-2`}><Plus size={16}/>Ajouter</button>}
           <span className={`text-xs ${C.td}`}>Min:</span>
           <input type="range" min="0" max="80" step="10" value={minScore} onChange={e=>setMinScore(Number(e.target.value))} className="w-20 accent-orange-500"/>
           <span className="text-xs text-orange-400 font-mono w-6">{minScore}</span>
           <Sel options={[{value:"squeezeScore",label:"Score"},{value:"shortInterest",label:"SI%"},{value:"daysToCover",label:"DTC"},{value:"costToBorrow",label:"CTB"}]} value={sortBy} onChange={e=>setSortBy(e.target.value)}/>
-          <button onClick={()=>{reset();setAdding(true);}} className={`${C.btn} ${C.btnP} flex items-center gap-2`}><Plus size={16}/>Ajouter</button>
         </div>
       </div>
 
+      {scanProgress&&<Card className="bg-blue-500/10 border-blue-500/20">
+        <p className="text-sm text-white font-semibold mb-2">{scanProgress.status}</p>
+        <div className="w-full bg-gray-800 rounded-full h-2"><div className="bg-blue-500 h-2 rounded-full transition-all" style={{width:`${(scanProgress.current/scanProgress.total)*100}%`}}/></div>
+      </Card>}
+
       <div className="bg-gray-800/30 border border-gray-700/40 rounded-lg p-3 text-xs text-gray-400 space-y-1">
-        <p><span className="font-semibold text-gray-300">Workflow :</span> Top 200 SI% sur <span className="text-blue-400">Finviz</span> (Short Float &gt; 5%) ou <span className="text-blue-400">TradingView</span> (Screener Short Interest). Saisir ici les candidats qualifiés.</p>
-        <p><span className="font-semibold text-gray-300">Routing auto :</span> Score {"\u2265"} 40 {"\u2192"} signal. <span className="text-purple-400">Options</span> si IV Rank &lt; 50. <span className="text-blue-400">CFD</span> si momentum (vol {"\u2265"} 2x) ou IV {"\u2265"} 70.</p>
-        <p><span className="font-semibold text-gray-300">Sources :</span> Finviz (primary) {"\u2192"} TradingView (fallback) {"\u2192"} Ortex/Fintel (CTB, SI delta)</p>
+        <p><span className="font-semibold text-gray-300">Auto :</span> SI%, DTC, Vol Relatif, Prix via <span className="text-blue-400">Finviz</span>. <span className="font-semibold text-gray-300">Manuel :</span> CTB, SI Delta, IV Rank, Put/Call via <span className="text-amber-400">Ortex/Fintel/IBKR</span>.</p>
+        <p><span className="font-semibold text-gray-300">Routing :</span> Score {"\u2265"} 40 {"\u2192"} signal. <span className="text-purple-400">Options</span> si IV Rank &lt; 50. <span className="text-blue-400">CFD</span> si momentum ou IV {"\u2265"} 70.</p>
       </div>
 
       {adding&&(
@@ -451,8 +635,25 @@ function SqueezeScanner({scannerItems,setScannerItems,suggestions,setSuggestions
         </Card>
       )}
 
+      {enrichingId&&(
+        <Card className="border-amber-500/20 bg-amber-500/5">
+          <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2"><Edit3 size={14} className="text-amber-400"/>Enrichir — {scannerItems.find(s=>s.id===enrichingId)?.ticker}</h3>
+          <p className={`text-xs ${C.tm} mb-3`}>Données manuelles (Ortex, Fintel, IBKR)</p>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <Input label="Cost to Borrow (%)" type="number" step="0.1" value={enrichForm.costToBorrow} onChange={e=>setEnrichForm({...enrichForm,costToBorrow:e.target.value})}/>
+            <Input label="SI Delta (%)" type="number" step="0.1" value={enrichForm.siDelta} onChange={e=>setEnrichForm({...enrichForm,siDelta:e.target.value})}/>
+            <Input label="IV Rank (0-100)" type="number" value={enrichForm.ivRank} onChange={e=>setEnrichForm({...enrichForm,ivRank:e.target.value})}/>
+            <Input label="Put/Call OI" type="number" step="0.01" value={enrichForm.putCallRatio} onChange={e=>setEnrichForm({...enrichForm,putCallRatio:e.target.value})}/>
+          </div>
+          <div className="flex gap-2 mt-4">
+            <button onClick={saveEnrichment} className={`${C.btn} ${C.btnS}`}><Save size={14} className="inline mr-1"/>Sauver</button>
+            <button onClick={()=>setEnrichingId(null)} className={`${C.btn} ${C.btnG}`}>Annuler</button>
+          </div>
+        </Card>
+      )}
+
       {sorted.length===0?(
-        <Card><div className="text-center py-12"><Search size={40} className={`mx-auto ${C.td} mb-3`}/><p className={C.tm}>Scanner vide{minScore>0?` (min ${minScore})`:""}</p></div></Card>
+        <Card><div className="text-center py-12"><Search size={40} className={`mx-auto ${C.td} mb-3`}/><p className={C.tm}>Scanner vide{minScore>0?` (min ${minScore})`:""} — Lancez un scan Finviz ou importez un CSV</p></div></Card>
       ):(
         <div className="space-y-3">{sorted.map(item=>(
           <Card key={item.id} className={`group border ${scoreBg(item.squeezeScore)}`}>
@@ -464,19 +665,22 @@ function SqueezeScanner({scannerItems,setScannerItems,suggestions,setSuggestions
                   <Badge color={item.squeezeScore>=70?"red":item.squeezeScore>=40?"amber":"gray"}>{item.squeezeScore>=70?"HIGH":item.squeezeScore>=40?"WATCH":"LOW"}</Badge>
                   <Badge color={item.routedTo==="options"?"purple":"blue"}><ArrowRightLeft size={10} className="inline mr-1"/>{item.routedTo==="options"?"\u2192 Options":"\u2192 CFD"}</Badge>
                   {item.source&&<Badge color="gray">{item.source}</Badge>}
+                  {item.price>0&&<span className={`text-xs ${C.tm}`}>${fmt(item.price,2)}</span>}
                 </div>
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mt-2">
-                  <div><p className={`text-xs ${C.td}`}>SI%</p><p className={`text-sm font-semibold ${item.shortInterest>=20?C.r:item.shortInterest>=10?C.y:"text-gray-300"}`}>{fmt(item.shortInterest,1)}%</p></div>
-                  <div><p className={`text-xs ${C.td}`}>DTC</p><p className={`text-sm font-semibold ${item.daysToCover>=5?C.r:"text-gray-300"}`}>{fmt(item.daysToCover,1)}j</p></div>
-                  <div><p className={`text-xs ${C.td}`}>CTB</p><p className={`text-sm font-semibold ${item.costToBorrow>=30?C.r:"text-gray-300"}`}>{fmt(item.costToBorrow,1)}%</p></div>
-                  <div><p className={`text-xs ${C.td}`}>SI {"\u0394"}</p><p className={`text-sm font-semibold ${item.siDelta>0?C.r:item.siDelta<0?C.g:"text-gray-300"}`}>{item.siDelta>0?"+":""}{fmt(item.siDelta,1)}%</p></div>
-                  <div><p className={`text-xs ${C.td}`}>Vol</p><p className={`text-sm font-semibold ${item.relativeVolume>=2?C.b:"text-gray-300"}`}>{fmt(item.relativeVolume,1)}x</p></div>
+                <div className="grid grid-cols-3 md:grid-cols-6 gap-3 mt-2">
+                  <div><p className={`text-xs ${C.td}`}>SI%</p><p className={`text-sm font-semibold ${item.shortInterest>=20?C.r:item.shortInterest>=10?C.y:"text-gray-300"}`}>{fmt(item.shortInterest,1)}%</p>{item.fetched&&<p className="text-xs text-blue-400">auto</p>}</div>
+                  <div><p className={`text-xs ${C.td}`}>DTC</p><p className={`text-sm font-semibold ${item.daysToCover>=5?C.r:"text-gray-300"}`}>{fmt(item.daysToCover,1)}j</p>{item.fetched&&<p className="text-xs text-blue-400">auto</p>}</div>
+                  <div><p className={`text-xs ${C.td}`}>CTB</p><p className={`text-sm font-semibold ${item.costToBorrow>=30?C.r:"text-gray-300"}`}>{item.costToBorrow>0?fmt(item.costToBorrow,1)+"%":"—"}</p><p className={`text-xs ${item.costToBorrow>0?"text-blue-400":"text-amber-400"}`}>{item.costToBorrow>0?"renseigné":"manuel"}</p></div>
+                  <div><p className={`text-xs ${C.td}`}>SI {"\u0394"}</p><p className={`text-sm font-semibold ${item.siDelta>0?C.r:item.siDelta<0?C.g:"text-gray-300"}`}>{item.siDelta?((item.siDelta>0?"+":"")+fmt(item.siDelta,1)+"%"):"—"}</p><p className={`text-xs ${item.siDelta?"text-blue-400":"text-amber-400"}`}>{item.siDelta?"renseigné":"manuel"}</p></div>
+                  <div><p className={`text-xs ${C.td}`}>IV Rank</p><p className={`text-sm font-semibold text-gray-300`}>{item.ivRank>0?fmt(item.ivRank,0):"—"}</p><p className={`text-xs ${item.ivRank>0?"text-blue-400":"text-amber-400"}`}>{item.ivRank>0?"renseigné":"manuel"}</p></div>
+                  <div><p className={`text-xs ${C.td}`}>Vol</p><p className={`text-sm font-semibold ${item.relativeVolume>=2?C.b:"text-gray-300"}`}>{fmt(item.relativeVolume,1)}x</p>{item.fetched&&<p className="text-xs text-blue-400">auto</p>}</div>
                 </div>
                 {item.notes&&<p className={`text-xs ${C.tm} mt-2 italic`}>"{item.notes}"</p>}
               </div>
               <div className="flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button onClick={()=>{setForm({...item,shortInterest:String(item.shortInterest),daysToCover:String(item.daysToCover),costToBorrow:String(item.costToBorrow),siDelta:String(item.siDelta),relativeVolume:String(item.relativeVolume),putCallRatio:String(item.putCallRatio||""),ivRank:String(item.ivRank||""),source:item.source||"finviz"});setEditId(item.id);setAdding(true);}} className="p-1.5 rounded hover:bg-gray-800 text-gray-400 hover:text-white"><Edit3 size={14}/></button>
-                <button onClick={()=>setScannerItems(prev=>prev.filter(s=>s.id!==item.id))} className="p-1.5 rounded hover:bg-gray-800 text-gray-400 hover:text-red-400"><Trash2 size={14}/></button>
+                <button onClick={()=>{const it=scannerItems.find(s=>s.id===item.id);setEnrichForm({costToBorrow:String(it?.costToBorrow||""),siDelta:String(it?.siDelta||""),ivRank:String(it?.ivRank||""),putCallRatio:String(it?.putCallRatio||"")});setEnrichingId(item.id);}} className="p-1.5 rounded hover:bg-gray-800 text-amber-400 hover:text-amber-300" title="Enrichir"><Edit3 size={14}/></button>
+                <button onClick={()=>{setForm({...item,shortInterest:String(item.shortInterest),daysToCover:String(item.daysToCover),costToBorrow:String(item.costToBorrow),siDelta:String(item.siDelta),relativeVolume:String(item.relativeVolume),putCallRatio:String(item.putCallRatio||""),ivRank:String(item.ivRank||""),source:item.source||"finviz"});setEditId(item.id);setAdding(true);}} className="p-1.5 rounded hover:bg-gray-800 text-gray-400 hover:text-white" title="Modifier"><Edit3 size={14}/></button>
+                <button onClick={()=>setScannerItems(prev=>prev.filter(s=>s.id!==item.id))} className="p-1.5 rounded hover:bg-gray-800 text-gray-400 hover:text-red-400" title="Supprimer"><Trash2 size={14}/></button>
               </div>
             </div>
           </Card>
@@ -926,8 +1130,10 @@ function MorningChecklist({checklist,setChecklist}){
   );
 }
 
-function Settings({accounts,setAccounts}){
+function Settings({accounts,setAccounts,ibkrConfig,setIbkrConfig}){
   const upd=(a,k,v)=>setAccounts(p=>({...p,[a]:{...p[a],[k]:v}}));
+  const [ibkrStatus,setIbkrStatus]=useState(null);
+  const testIBKR=async()=>{setIbkrStatus('testing');const r=await ibkrTestConnection(ibkrConfig);setIbkrStatus(r);setTimeout(()=>setIbkrStatus(null),5000);};
   return(
     <div className="space-y-6 max-w-3xl">
       <h2 className="text-lg font-bold text-white">Parametres</h2>
@@ -944,6 +1150,19 @@ function Settings({accounts,setAccounts}){
           </div>
         </Card>
       ))}
+      <Card>
+        <h3 className="text-sm font-semibold text-white mb-4 flex items-center gap-2"><Radio size={16} className="text-green-400"/>IBKR Client Portal Gateway</h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <Input label="Gateway URL" value={ibkrConfig.url} onChange={e=>setIbkrConfig(p=>({...p,url:e.target.value}))}/>
+            <p className={`text-xs ${C.td} mt-2`}>Lancez le Client Portal Gateway IBKR sur votre machine. Il tourne en local sur le port 5000 par défaut.</p>
+          </div>
+          <div className="flex flex-col gap-3">
+            <button onClick={testIBKR} className={`${C.btn} ${C.btnP} self-start`}>{ibkrStatus==='testing'?'Test...':'Tester connexion'}</button>
+            {ibkrStatus&&ibkrStatus!=='testing'&&<p className={`text-xs ${ibkrStatus.connected?C.g:C.r}`}>{ibkrStatus.message}</p>}
+          </div>
+        </div>
+      </Card>
     </div>
   );
 }
@@ -970,6 +1189,7 @@ export default function App(){
   const [scannerItems,setScannerItems]=useState([]);
   const [events,setEvents]=useState(defaultEvents);
   const [suggestions,setSuggestions]=useState([]);
+  const [ibkrConfig,setIbkrConfig]=useState({url:'https://localhost:5000',connected:false});
 
   const trades=activeAccount==="cfd"?cfdTrades:optTrades;
   const setTrades=activeAccount==="cfd"?setCfdTrades:setOptTrades;
@@ -1020,7 +1240,7 @@ export default function App(){
         {tab==="watchlist"&&<Watchlist watchlist={watchlist} setWatchlist={setWatchlist}/>}
         {tab==="sizer"&&<PositionSizer activeAccount={activeAccount} account={account} onTrade={addTrade}/>}
         {tab==="log"&&<TradeLog trades={trades} setTrades={setTrades} account={account} activeAccount={activeAccount}/>}
-        {tab==="settings"&&<Settings accounts={accounts} setAccounts={setAccounts}/>}
+        {tab==="settings"&&<Settings accounts={accounts} setAccounts={setAccounts} ibkrConfig={ibkrConfig} setIbkrConfig={setIbkrConfig}/>}
       </main>
       <footer className="border-t border-gray-800 py-3 text-center"><p className={`text-xs ${C.td}`}>1-9 naviguer | Export JSON | 2 comptes independants | Scanner connecte aux 2 books</p></footer>
     </div>
